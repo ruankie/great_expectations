@@ -15,6 +15,7 @@ from great_expectations.execution_engine import (
     ExecutionEngine,
     SqlAlchemyExecutionEngine,
 )
+from great_expectations.experimental.datasources import SqliteDatasource
 from great_expectations.experimental.datasources.interfaces import (
     BatchRequest,
     DataAsset,
@@ -42,17 +43,24 @@ SAMPLE_JSON_DIR: Final[pathlib.Path] = pathlib.Path(
 ).resolve(strict=True)
 
 
-def sql_data(
-    context: AbstractDataContext,
-) -> tuple[AbstractDataContext, Datasource, DataAsset, BatchRequest]:
+def sqlite_datasource(
+    context: AbstractDataContext, db_filename: str
+) -> SqliteDatasource:
     db_file = (
         pathlib.Path(__file__)
-        / "../../../test_sets/taxi_yellow_tripdata_samples/sqlite/yellow_tripdata.db"
+        / f"../../../test_sets/taxi_yellow_tripdata_samples/sqlite/{db_filename}"
     ).resolve()
     datasource = context.sources.add_sqlite(
         name="test_datasource",
         connection_string=f"sqlite:///{db_file}",
     )
+    return datasource
+
+
+def sql_data(
+    context: AbstractDataContext,
+) -> tuple[AbstractDataContext, Datasource, DataAsset, BatchRequest]:
+    datasource = sqlite_datasource(context, "yellow_tripdata.db")
     asset = (
         datasource.add_table_asset(
             name="my_asset",
@@ -257,13 +265,8 @@ def test_run_data_assistant_and_checkpoint(datasource_test_data):
 def multibatch_sql_data(
     context: AbstractDataContext,
 ) -> tuple[AbstractDataContext, Datasource, DataAsset, BatchRequest]:
-    db_file = (
-        pathlib.Path(__file__)
-        / "../../../test_sets/taxi_yellow_tripdata_samples/sqlite/yellow_tripdata_sample_2020_all_months_combined.db"
-    ).resolve()
-    datasource = context.sources.add_sqlite(
-        name="test_datasource",
-        connection_string=f"sqlite:///{db_file}",
+    datasource = sqlite_datasource(
+        context, "yellow_tripdata_sample_2020_all_months_combined.db"
     )
     asset = (
         datasource.add_table_asset(
@@ -515,3 +518,26 @@ def test_batch_head(
         assert n_rows_validation_error in str(
             e.value
         ) or fetch_all_validation_error in str(e.value)
+
+
+def test_sql_query_data_asset(empty_data_context):
+    context = empty_data_context
+    datasource = sqlite_datasource(context, "yellow_tripdata.db")
+    passenger_count_value = 5
+    asset = (
+        datasource.add_query_asset(
+            name="query_asset",
+            query=f"SELECT * from yellow_tripdata_sample_2019_02 WHERE passenger_count = {passenger_count_value}",
+        )
+        .add_year_and_month_splitter(column_name="pickup_datetime")
+        .add_sorters(["year", "month"])
+    )
+    validator = context.get_validator(
+        batch_request=asset.get_batch_request({"year": 2019, "month": 2})
+    )
+    result = validator.expect_column_distinct_values_to_equal_set(
+        column="passenger_count",
+        value_set=[passenger_count_value],
+        result_format={"result_format": "BOOLEAN_ONLY"},
+    )
+    assert result.success

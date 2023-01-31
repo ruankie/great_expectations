@@ -5,6 +5,7 @@ import itertools
 from datetime import datetime
 from typing import (
     TYPE_CHECKING,
+    Any,
     Callable,
     Dict,
     List,
@@ -45,7 +46,7 @@ class ColumnSplitter:
     method_name: str
     param_names: Sequence[str]
 
-    def param_defaults(self, table_asset: TableAsset) -> Dict[str, List]:
+    def param_defaults(self, sql_asset: SqlAsset) -> Dict[str, List]:
         raise NotImplementedError
 
     @pydantic.validator("method_name")
@@ -80,19 +81,19 @@ class SqlYearMonthSplitter(ColumnSplitter):
         default_factory=lambda: ["year", "month"]
     )
 
-    def param_defaults(self, table_asset: TableAsset) -> Dict[str, List]:
+    def param_defaults(self, sql_asset: SqlAsset) -> Dict[str, List]:
         """Query sql database to get the years and months to split over.
 
         Args:
-            table_asset: A TableAsset over which we want to split the data.
+            sql_asset: A SqlAsset over which we want to split the data.
         """
         return _query_for_year_and_month(
-            table_asset, self.column_name, _get_sql_datetime_range
+            sql_asset, self.column_name, _get_sql_datetime_range
         )
 
 
 def _query_for_year_and_month(
-    table_asset: TableAsset,
+    sql_asset: SqlAsset,
     column_name: str,
     query_datetime_range: Callable[
         [sqlalchemy.engine.base.Connection, str, str], DatetimeRange
@@ -102,14 +103,12 @@ def _query_for_year_and_month(
     # after construction. We may be able to use a hook in a property setter.
     from great_expectations.execution_engine import SqlAlchemyExecutionEngine
 
-    assert isinstance(
-        table_asset.datasource.execution_engine, SqlAlchemyExecutionEngine
-    )
+    assert isinstance(sql_asset.datasource.execution_engine, SqlAlchemyExecutionEngine)
 
-    with table_asset.datasource.execution_engine.engine.connect() as conn:
+    with sql_asset.datasource.execution_engine.engine.connect() as conn:
         datetimes: DatetimeRange = query_datetime_range(
             conn,
-            table_asset.table_name,
+            sql_asset.data_from(),
             column_name,
         )
     year: List[int] = list(range(datetimes.min.year, datetimes.max.year + 1))
@@ -121,18 +120,27 @@ def _query_for_year_and_month(
     return {"year": year, "month": month}
 
 
+SQL_DATETIME_COUNTER = 0
+
+
 def _get_sql_datetime_range(
-    conn: sqlalchemy.engine.base.Connection, table_name: str, col_name: str
+    conn: sqlalchemy.engine.base.Connection, data_from: str, col_name: str
 ) -> DatetimeRange:
-    q = f"select min({col_name}), max({col_name}) from {table_name}"
+    global SQL_DATETIME_COUNTER
+    from_name = f"_gx_sql_datetime_range_data_{SQL_DATETIME_COUNTER}"
+    SQL_DATETIME_COUNTER += 1
+    q = f"select min({col_name}), max({col_name}) from ({data_from}) as {from_name}"
     min_max_dt = list(conn.execute(q))[0]
+    if min_max_dt[0] is None or min_max_dt[1] is None:
+        raise SQLDatasourceError(
+            f"Data date range can not be determined for the query: {q}. The returned range was {min_max_dt}."
+        )
     return DatetimeRange(min=min_max_dt[0], max=min_max_dt[1])
 
 
-class TableAsset(DataAsset):
+class SqlAsset(DataAsset):
     # Instance fields
-    type: Literal["table"] = "table"
-    table_name: str
+    type: Literal["sqlasset"] = "sqlasset"
     column_splitter: Optional[SqlYearMonthSplitter] = None
     name: str
 
@@ -154,14 +162,14 @@ class TableAsset(DataAsset):
     def add_year_and_month_splitter(
         self,
         column_name: str,
-    ) -> TableAsset:
+    ) -> SqlAsset:
         """Associates a year month splitter with this DataAsset
 
         Args:
             column_name: A column name of the date column where year and month will be parsed out.
 
         Returns:
-            This TableAsset so we can use this method fluently.
+            This SqlAsset so we can use this method fluently.
         """
         self.column_splitter = SqlYearMonthSplitter(
             column_name=column_name,
@@ -240,12 +248,7 @@ class TableAsset(DataAsset):
         column_splitter = self.column_splitter
         for request in self._fully_specified_batch_requests(batch_request):
             batch_metadata = copy.deepcopy(request.options)
-            batch_spec_kwargs = {
-                "type": "table",
-                "data_asset_name": self.name,
-                "table_name": self.table_name,
-                "batch_identifiers": {},
-            }
+            batch_spec_kwargs = self._create_batch_spec_kwargs()
             if column_splitter:
                 batch_spec_kwargs["splitter_method"] = column_splitter.method_name
                 batch_spec_kwargs["splitter_kwargs"] = {
@@ -295,6 +298,72 @@ class TableAsset(DataAsset):
         self.sort_batches(batch_list)
         return batch_list
 
+    def _create_batch_spec_kwargs(self) -> dict[str, Any]:
+        """Creates batch_spec_kwargs used to instantiate a SqlAlchemyDatasourceBatchSpec
+
+        This is called by get_batch_list_from_batch_request to generate the batches.
+
+        Returns:
+            A dictionary that will be passed to SqlAlchemyDatasourceBatchSpec(**returned_dict)
+        """
+        raise NotImplementedError
+
+    def data_from(self) -> str:
+        """Returns the from clause that would be used to query this data
+
+        Returns:
+            The from clause which might be a table name or a query.
+        """
+        raise NotImplementedError
+
+
+class QueryAsset(SqlAsset):
+    # Instance fields
+    type: Literal["query"] = "query"  # type: ignore[assignment]
+    query: str
+
+    @pydantic.validator("query")
+    def query_must_start_with_select(cls, v: str):
+        if not (v.upper().startswith("SELECT") and v[6].isspace()):
+            raise ValueError("query must start with 'SELECT' followed by a whitespace.")
+        return v
+
+    def data_from(self) -> str:
+        """Returns the query that is used to generate the data.
+
+        This can be used in a subselect from clause for queries against this data.
+        """
+        return self.query
+
+    def _create_batch_spec_kwargs(self) -> dict[str, Any]:
+        return {
+            "data_asset_name": self.name,
+            "query": self.query,
+            "temp_table_schema_name": None,
+            "batch_identifiers": {},
+        }
+
+
+class TableAsset(SqlAsset):
+    # Instance fields
+    type: Literal["table"] = "table"  # type: ignore[assignment]
+    table_name: str
+
+    def data_from(self) -> str:
+        """Returns the table name.
+
+        This can be used in a from clause for a query against this data.
+        """
+        return self.table_name
+
+    def _create_batch_spec_kwargs(self) -> dict[str, Any]:
+        return {
+            "type": "table",
+            "data_asset_name": self.name,
+            "table_name": self.table_name,
+            "batch_identifiers": {},
+        }
+
 
 class SQLDatasource(Datasource):
     """Adds a generic SQL datasource to the data context.
@@ -303,18 +372,18 @@ class SQLDatasource(Datasource):
         name: The name of this datasource
         connection_string: The SQLAlchemy connection string used to connect to the database.
             For example: "postgresql+psycopg2://postgres:@localhost/test_database"
-        assets: An optional dictionary whose keys are TableAsset names and whose values
-            are TableAsset objects.
+        assets: An optional dictionary whose keys are SqlAsset names and whose values
+            are SqlAsset objects.
     """
 
     # class var definitions
-    asset_types: ClassVar[List[Type[DataAsset]]] = [TableAsset]
+    asset_types: ClassVar[List[Type[DataAsset]]] = [TableAsset, QueryAsset]
 
     # right side of the operator determines the type name
     # left side enforces the names on instance creation
     type: Literal["sql"] = "sql"
     connection_string: str
-    assets: Dict[str, TableAsset] = {}
+    assets: Dict[str, SqlAsset] = {}
 
     @property
     def execution_engine_type(self) -> Type[ExecutionEngine]:
@@ -344,5 +413,28 @@ class SQLDatasource(Datasource):
             table_name=table_name,
             order_by=order_by or [],  # type: ignore[arg-type]  # coerce list[str]
             # see DataAsset._parse_order_by_sorter()
+        )
+        return self.add_asset(asset)
+
+    def add_query_asset(
+        self,
+        name: str,
+        query: str,
+        order_by: Optional[BatchSortersDefinition] = None,
+    ) -> QueryAsset:
+        """Adds a query asset to this datasource.
+
+        Args:
+            name: The name of this table asset.
+            query: The SELECT query to selects the data to validate. It must begin with the "SELECT".
+            order_by: A list of BatchSorters or BatchSorter strings.
+
+        Returns:
+            The QueryAsset that is added to the datasource.
+        """
+        asset = QueryAsset(
+            name=name,
+            query=query,
+            order_by=order_by or [],  # type: ignore[arg-type]  # coerce list[str]
         )
         return self.add_asset(asset)
