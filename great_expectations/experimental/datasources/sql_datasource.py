@@ -46,7 +46,7 @@ class ColumnSplitter:
     method_name: str
     param_names: Sequence[str]
 
-    def param_defaults(self, sql_asset: SqlAsset) -> Dict[str, List]:
+    def param_defaults(self, sql_asset: SQLAsset) -> Dict[str, List]:
         raise NotImplementedError
 
     @pydantic.validator("method_name")
@@ -81,11 +81,11 @@ class SqlYearMonthSplitter(ColumnSplitter):
         default_factory=lambda: ["year", "month"]
     )
 
-    def param_defaults(self, sql_asset: SqlAsset) -> Dict[str, List]:
+    def param_defaults(self, sql_asset: SQLAsset) -> Dict[str, List]:
         """Query sql database to get the years and months to split over.
 
         Args:
-            sql_asset: A SqlAsset over which we want to split the data.
+            sql_asset: A SQLAsset over which we want to split the data.
         """
         return _query_for_year_and_month(
             sql_asset, self.column_name, _get_sql_datetime_range
@@ -93,7 +93,7 @@ class SqlYearMonthSplitter(ColumnSplitter):
 
 
 def _query_for_year_and_month(
-    sql_asset: SqlAsset,
+    sql_asset: SQLAsset,
     column_name: str,
     query_datetime_range: Callable[
         [sqlalchemy.engine.base.Connection, str, str], DatetimeRange
@@ -138,7 +138,7 @@ def _get_sql_datetime_range(
     return DatetimeRange(min=min_max_dt[0], max=min_max_dt[1])
 
 
-class SqlAsset(DataAsset):
+class SQLAsset(DataAsset):
     # Instance fields
     type: Literal["sqlasset"] = "sqlasset"
     column_splitter: Optional[SqlYearMonthSplitter] = None
@@ -162,14 +162,14 @@ class SqlAsset(DataAsset):
     def add_year_and_month_splitter(
         self,
         column_name: str,
-    ) -> SqlAsset:
+    ) -> SQLAsset:
         """Associates a year month splitter with this DataAsset
 
         Args:
             column_name: A column name of the date column where year and month will be parsed out.
 
         Returns:
-            This SqlAsset so we can use this method fluently.
+            This SQLAsset so we can use this method fluently.
         """
         self.column_splitter = SqlYearMonthSplitter(
             column_name=column_name,
@@ -317,7 +317,7 @@ class SqlAsset(DataAsset):
         raise NotImplementedError
 
 
-class QueryAsset(SqlAsset):
+class QueryAsset(SQLAsset):
     # Instance fields
     type: Literal["query"] = "query"  # type: ignore[assignment]
     query: str
@@ -344,7 +344,7 @@ class QueryAsset(SqlAsset):
         }
 
 
-class TableAsset(SqlAsset):
+class TableAsset(SQLAsset):
     # Instance fields
     type: Literal["table"] = "table"  # type: ignore[assignment]
     table_name: str
@@ -372,8 +372,8 @@ class SQLDatasource(Datasource):
         name: The name of this datasource
         connection_string: The SQLAlchemy connection string used to connect to the database.
             For example: "postgresql+psycopg2://postgres:@localhost/test_database"
-        assets: An optional dictionary whose keys are SqlAsset names and whose values
-            are SqlAsset objects.
+        assets: An optional dictionary whose keys are SQLAsset names and whose values
+            are SQLAsset objects.
     """
 
     # class var definitions
@@ -383,7 +383,7 @@ class SQLDatasource(Datasource):
     # left side enforces the names on instance creation
     type: Literal["sql"] = "sql"
     connection_string: str
-    assets: Dict[str, SqlAsset] = {}
+    assets: Dict[str, SQLAsset] = {}
 
     @property
     def execution_engine_type(self) -> Type[ExecutionEngine]:
